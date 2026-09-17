@@ -5,6 +5,7 @@ import in.simplifymoney.ledgersync.model.Category;
 import in.simplifymoney.ledgersync.model.Direction;
 import in.simplifymoney.ledgersync.model.NormalizedTxn;
 import in.simplifymoney.ledgersync.model.RawMessage;
+import in.simplifymoney.ledgersync.model.TxnKey;
 import in.simplifymoney.ledgersync.parse.ParsedTxn;
 import in.simplifymoney.ledgersync.parse.Parsers;
 import in.simplifymoney.ledgersync.store.LedgerStore;
@@ -13,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -39,16 +41,105 @@ public final class IngestService {
         List<RawMessage> messages = readCorpus(corpus);
         int parsed = 0;
         int skipped = 0;
+
+        Map<TxnKey, List<ParsedTxn>> grouped = new LinkedHashMap<>();
+
         for (RawMessage m : messages) {
             Optional<ParsedTxn> p = parsers.parse(m);
             if (p.isEmpty()) {
                 skipped++;
                 continue;
             }
-            store.save(toTransaction(p.get()));
             parsed++;
+            ParsedTxn t = p.get();
+            TxnKey key = new TxnKey(t.accountLast4(), t.occurredAt(), t.direction(), t.amount(), t.merchant());
+            grouped.computeIfAbsent(key, k -> new ArrayList<>()).add(t);
         }
-        return new Stats(messages.size(), parsed, skipped);
+
+        int written = 0;
+        for (Map.Entry<TxnKey, List<ParsedTxn>> entry : grouped.entrySet()) {
+            List<ParsedTxn> txns = entry.getValue();
+            ParsedTxn first = txns.get(0);
+
+            List<String> messageIds = txns.stream()
+                    .map(ParsedTxn::sourceMessageId)
+                    .distinct()
+                    .toList();
+
+            String merchant = txns.stream()
+                    .map(ParsedTxn::merchant)
+                    .filter(m -> m != null && !m.isBlank())
+                    .findFirst()
+                    .orElse(first.merchant());
+
+            Category category = determineCategory(first, grouped.keySet());
+
+            NormalizedTxn normalized = new NormalizedTxn(
+                    first.accountLast4(),
+                    first.occurredAt(),
+                    first.direction(),
+                    first.amount(),
+                    category,
+                    merchant,
+                    messageIds);
+            store.save(normalized);
+            written++;
+        }
+
+        return new Stats(messages.size(), written, skipped);
+    }
+
+    private Category determineCategory(ParsedTxn p, java.util.Set<TxnKey> allKeys) {
+        String merchantUpper = p.merchant() != null ? p.merchant().toUpperCase() : "";
+
+        if (isSelfTransfer(p, allKeys, merchantUpper)) {
+            return Category.TRANSFER;
+        }
+
+        if (p.direction() == Direction.CREDIT) {
+            return Category.INCOME;
+        }
+
+        boolean isUpi = merchantUpper.startsWith("UPI/") || merchantUpper.contains("UPI");
+        if (isUpi && p.amount().compareTo(new java.math.BigDecimal("100.00")) <= 0) {
+            return Category.MICRO;
+        }
+
+        return Category.SPEND;
+    }
+
+    private boolean isSelfTransfer(ParsedTxn p, java.util.Set<TxnKey> allKeys, String merchantUpper) {
+        if (merchantUpper.contains("SELF") || merchantUpper.contains("OWN A/C") || merchantUpper.contains("INTERNAL")) {
+            return true;
+        }
+
+        Direction oppositeDirection = p.direction() == Direction.DEBIT ? Direction.CREDIT : Direction.DEBIT;
+        String pName = cleanHolderName(p.merchant());
+
+        for (TxnKey other : allKeys) {
+            if (!other.accountLast4().equals(p.accountLast4())
+                    && other.direction() == oppositeDirection
+                    && other.amount().compareTo(p.amount()) == 0) {
+
+                String otherName = cleanHolderName(other.merchant());
+
+                if (!pName.isEmpty() && pName.equalsIgnoreCase(otherName)) {
+                    long secondsDiff = Math
+                            .abs(java.time.Duration.between(p.occurredAt(), other.occurredAt()).getSeconds());
+                    if (secondsDiff <= 300) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private static String cleanHolderName(String merchant) {
+        if (merchant == null)
+            return "";
+        String cleaned = merchant.trim().toUpperCase();
+        return cleaned.replaceAll("^(IMPS/P2A/|IMPS/|NEFT/|UPI/P2P/|UPI/)", "").trim();
     }
 
     public static List<RawMessage> readCorpus(Path corpus) throws IOException {
@@ -68,11 +159,6 @@ public final class IngestService {
         return out;
     }
 
-    private NormalizedTxn toTransaction(ParsedTxn p) {
-        Category c = p.direction() == Direction.DEBIT ? Category.SPEND : Category.INCOME;
-        return new NormalizedTxn(p.accountLast4(), p.occurredAt(), p.direction(),
-                p.amount(), c, p.merchant(), List.of(p.sourceMessageId()));
+    public record Stats(int messagesRead, int transactionsWritten, int messagesSkipped) {
     }
-
-    public record Stats(int messagesRead, int transactionsWritten, int messagesSkipped) {}
 }

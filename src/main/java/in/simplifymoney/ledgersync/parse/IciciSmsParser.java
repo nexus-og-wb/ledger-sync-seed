@@ -32,11 +32,13 @@ public final class IciciSmsParser implements MessageParser {
     @Override
     public Optional<ParsedTxn> parse(RawMessage m) {
         Matcher v1 = V1.matcher(m.body());
-        if (!v1.find()) return Optional.empty();
+        if (!v1.find())
+            return Optional.empty();
 
         BigDecimal amount = Amounts.first(m.body());
         OffsetDateTime at = Dates.ist(v1.group("when"));
-        if (amount == null || at == null) return Optional.empty();
+        if (amount == null || at == null)
+            return Optional.empty();
 
         Direction d = "debited".equals(v1.group("dir")) ? Direction.DEBIT : Direction.CREDIT;
         return Optional.of(new ParsedTxn(v1.group("acct"), at, d, amount,
