@@ -42,6 +42,32 @@ class AmountsTest {
     }
 
     @Test
+    void readsWholeRupeeAmountWithoutDecimals() {
+        assertEquals(new BigDecimal("5.00"),
+                Amounts.first("Rs.5 debited from a/c **4821 on 04-07-26 at 07:19 to UPI/WATER CAN. Avl Bal: Rs.92,213.10."));
+    }
+
+    @Test
+    void readsInrWithoutSpaceOrDecimals() {
+        assertEquals(new BigDecimal("99.00"),
+                Amounts.first("Sent INR99\nTo: UPI/VEGETABLE VENDOR\nOn: 26 Jul 26 09:47\nA/c: XX4821\nAvailable Balance: INR 39203.03"));
+    }
+
+    @Test
+    void readsInrWithThousandsSeparatorNoDecimals() {
+        assertEquals(new BigDecimal("4200.00"),
+                Amounts.first("ICICI Bank Acct XX9075 Dr INR 4,200 on 27-Jul-2026 12:00; MYNTRA ref no 263970554183. BalAvl Rs 47,805.13"));
+    }
+
+    @Test
+    void readsMultipleCommasIndianFormatting() {
+        assertEquals(new BigDecimal("200000.00"),
+                Amounts.first("Rs.2,00,000.00 debited from a/c **4821 on 04-07-26 at 07:19. Avl Bal: Rs.5,00,000.00."));
+        assertEquals(new BigDecimal("200000.00"),
+                Amounts.first("INR 2,00,000 debited from a/c **4821 on 04-07-26 at 07:19. Avl Bal: Rs.5,00,000.00."));
+    }
+
+    @Test
     void ignoresAMessageWithNoAmountAtAll() {
         assertEquals(null, Amounts.first("Your Swiggy order is on the way!"));
     }
