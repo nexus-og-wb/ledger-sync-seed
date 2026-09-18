@@ -109,10 +109,6 @@ public final class IngestService {
     }
 
     private boolean isSelfTransfer(ParsedTxn p, java.util.Set<TxnKey> allKeys, String merchantUpper) {
-        if (merchantUpper.contains("SELF") || merchantUpper.contains("OWN A/C") || merchantUpper.contains("INTERNAL")) {
-            return true;
-        }
-
         Direction oppositeDirection = p.direction() == Direction.DEBIT ? Direction.CREDIT : Direction.DEBIT;
         String pName = cleanHolderName(p.merchant());
 
