@@ -1,17 +1,17 @@
 # Ledger Sync Seed
 
-A financial transaction ingestion, normalization, and ledger persistence engine built in plain Java. The service reads raw, unstructured bank SMS and email messages from user devices, converts them into canonical double-entry financial transactions, categorizes and deduplicates them, reconciles running balances against stated bank balances, and provides dual persistence across relational (SQL/H2) and document-oriented (MongoDB) storage.
+A financial transaction ingestion, normalization, and ledger persistence engine built in plain Java. The service reads raw bank SMS and email messages from user devices, converts them into canonical financial transactions, categorizes and deduplicates them, reconciles running balances against stated bank balances, and provides persistence across relational (SQL/H2) and document-oriented (MongoDB) storage.
 
 ---
 
 ## Overview
 
-The processing pipeline operates in five distinct phases:
+The processing pipeline operates in five phases:
 
 1. **Messages**: Ingests raw SMS and email uploads (`fixtures/corpus-a.jsonl`), preserving raw message identifiers and arrival timestamps.
-2. **Parsing & Normalization**: Format-specific parsers (HDFC SMS, ICICI SMS, and bank email) extract the bank-stated transaction timestamp (`occurred_at` in IST), account identifier, transaction direction (`DEBIT`/`CREDIT`), exact monetary amount, and merchant name into an immutable, frozen `NormalizedTxn` contract.
+2. **Parsing & Normalization**: Format-specific parsers (HDFC SMS, ICICI SMS, and bank email) extract the bank-stated transaction timestamp (`occurred_at` in IST), account identifier, transaction direction (`DEBIT`/`CREDIT`), exact monetary amount, and merchant name into an immutable `NormalizedTxn` record.
 3. **Ledger Engine & Deduplication**: Groups multi-channel alerts referencing the same underlying real-world event into a single canonical transaction, consolidating all evidencing message IDs. Identifies transfers between the user's own accounts and isolates micro-spends (UPI debits <= ₹100).
-4. **Persistence**: Saves transactions and discrepancies to the active storage engine via the `LedgerStore` abstraction. The service supports an in-memory store for isolated verification, an embedded SQL/H2 store via JDBC, and a production-grade MongoDB document store.
+4. **Persistence**: Saves transactions and discrepancies to the active storage engine via the `LedgerStore` abstraction. The service supports an in-memory store for isolated verification, an embedded SQL/H2 store via JDBC, and a MongoDB document store.
 5. **Reconciliation**: Evaluates running account balances against bank-stated balances in parsed messages, surfacing any unaccounted gaps as explicit `Discrepancy` records.
 
 ---
@@ -54,7 +54,7 @@ The processing pipeline operates in five distinct phases:
               SqlLedgerStore
                      │
                      ▼
-           Backfill Process (Idempotent consolidation)
+           Backfill Process (Consolidation & Migration)
                      │
                      ▼
              MongoDocumentStore
@@ -71,11 +71,11 @@ The processing pipeline operates in five distinct phases:
 
 ## Tech Stack
 
-* **Java 21**: Core application language, utilizing modern Java features (records, pattern matching, sealed types).
+* **Java 21**: Core application language, utilizing records, pattern matching, and sealed types.
 * **Gradle 9.2.0**: Build tool, dependency management, and execution harness (wrapper included).
 * **H2 Database 2.2.224**: Embedded SQL database loaded via standard `java.sql` / JDBC.
 * **MongoDB 7.0**: Document database deployed via Docker Compose.
-* **Official MongoDB Java Driver (Sync) 5.3.1**: Official driver (`org.mongodb:mongodb-driver-sync` and `org.mongodb:bson`) for connection pooling, BSON document modeling, and index management.
+* **Official MongoDB Java Driver (Sync) 5.3.1**: Official driver (`org.mongodb:mongodb-driver-sync` and `org.mongodb:bson`) for connection management, BSON document modeling, and index creation.
 * **JUnit 5.10.2**: Testing framework for unit, integration, and contract test suites.
 * **Testcontainers 1.20.4**: Integration test container management.
 
@@ -201,7 +201,7 @@ Migrate historical transactions and discrepancies from H2 into MongoDB:
 *Note: Safe to run repeatedly; subsequent runs detect existing records and skip them.*
 
 ### 7. Run Consistency Checker
-Verify that SQL and MongoDB are strictly synchronized across all fields:
+Verify that SQL and MongoDB are synchronized across all fields:
 ```bash
 ./gradlew run --args="check"
 ```
@@ -235,8 +235,8 @@ docker compose down
 }
 ```
 
-* **Monetary Precision (`Decimal128`)**: Floating-point representations (`double`) introduce binary precision errors. MongoDB's BSON `Decimal128` maps directly to Java's `BigDecimal` and guarantees 2 exact decimal places to the paisa.
-* **Timestamp & Offset (`OffsetDateTime`)**: Preserved as an ISO-8601 string (`YYYY-MM-DDTHH:mm:ss+HH:MM`), maintaining the bank's stated `+05:30` IST offset and allowing chronological lexicographical indexing.
+* **Monetary Precision (`Decimal128`)**: Binary floating-point representations (`double`) introduce precision errors. MongoDB's BSON `Decimal128` maps to Java's `BigDecimal` and stores values with 2 decimal places to the paisa.
+* **Timestamp & Offset (`OffsetDateTime`)**: Preserved as an ISO-8601 string (`YYYY-MM-DDTHH:mm:ss+HH:MM`) in IST (`+05:30`), allowing chronological string comparisons and indexing.
 
 ### 2. The Three Required Access Patterns & Supporting Indexes
 
@@ -245,92 +245,91 @@ docker compose down
 1. **Q1: One account's transactions for one month, newest first**
    * **Method**: `List<NormalizedTxn> forAccountMonth(String accountLast4, YearMonth month)`
    * **Supporting Index**: Compound index `{ "account_last4": 1, "occurred_at": -1 }` (`idx_account_occurred`)
-   * **Behavior**: Covers account equality, month range boundaries, and descending timestamp sorting without an in-memory sort.
+   * **Behavior**: The compound index supports filtering by account and occurred_at while maintaining the requested timestamp ordering.
 
 2. **Q2: Running totals per category for an account**
    * **Method**: `Map<Category, BigDecimal> categoryTotals(String accountLast4)`
    * **Supporting Index**: Compound index `{ "account_last4": 1, "category": 1, "amount": 1 }` (`idx_account_cat_amt`)
-   * **Behavior**: Covered index scan where the aggregation pipeline computes category sums directly from index keys.
+   * **Behavior**: Supports the aggregation pipeline matching on account and grouping by category with amount summation.
 
 3. **Q3: Transaction produced by a message ID**
    * **Method**: `Optional<NormalizedTxn> byMessageId(String messageId)`
    * **Supporting Index**: Multikey index `{ "source_message_ids": 1 }` (`idx_source_msg`)
-   * **Behavior**: Provides an exact point lookup in `O(log N)` time for any message ID array element.
+   * **Behavior**: Uses the `source_message_ids` index to locate transactions by message ID.
 
 4. **Idempotency Constraint**
    * **Supporting Index**: Unique index `{ "txn_key": 1 }` (`idx_txn_key_unique`)
-   * **Behavior**: Enforces database-level uniqueness on natural transaction identity.
+   * **Behavior**: Enforces uniqueness on the computed natural transaction key.
 
-### 3. The Six Examined-vs-Returned Numbers (at 100,000 Transactions)
+### 3. Observed Explain Statistics (at 100,000 Transactions)
 
-Measured against 100,000 indexed transactions using MongoDB's `explain("executionStats")`:
+The following values were observed using MongoDB explain execution statistics at 100,000 transactions:
 
-| Access Pattern | Method | `totalDocsExamined` | `nReturned` | Explanation |
+| Access Pattern | Method | `totalDocsExamined` | `nReturned` | Supporting Index |
 |---|---|---|---|---|
-| **Q1** | `forAccountMonth` | **2,976** | **2,976** | **1:1 efficiency**. Index `{ account_last4: 1, occurred_at: -1 }` covers equality, date range, and sort order. |
-| **Q2** | `categoryTotals` | **0** | **20,000** | **Covered query**. Index `{ account_last4: 1, category: 1, amount: 1 }` satisfies the aggregation without fetching raw documents. |
-| **Q3** | `byMessageId` | **1** | **1** | **Point lookup**. Multikey index `{ source_message_ids: 1 }` directly retrieves the matching document. |
+| **Q1** | `forAccountMonth` | **2,976** | **2,976** | `{ "account_last4": 1, "occurred_at": -1 }` |
+| **Q2** | `categoryTotals` | **0** | **20,000** | `{ "account_last4": 1, "category": 1, "amount": 1 }` |
+| **Q3** | `byMessageId` | **1** | **1** | `{ "source_message_ids": 1 }` |
 
 ---
 
 ## Engineering Decisions & Trade-offs
 
 ### SQL → MongoDB Migration
-The legacy implementation stored transactions in a relational SQL table (`ledger`) in H2. In the relational schema, `source_message_ids` was represented as a denormalized comma-separated string (`VARCHAR(500)`). This made querying which transaction was produced by a given message ID inefficient, requiring table scans with string operations (`LIKE '%msgId%'`). 
+The original implementation stored transactions in a relational SQL table (`ledger`) in H2. In the relational schema, `source_message_ids` was represented as a denormalized comma-separated string (`VARCHAR(500)`). Querying which transaction was produced by a given message ID required table scans with string pattern matching (`LIKE '%msgId%'`).
 
-Migrating to MongoDB provided a natural document representation where `source_message_ids` is stored as a native array of strings. Combined with MongoDB's multikey index capability, message-level lookups become `O(log N)` point operations. Furthermore, document storage allows grouping all evidencing message IDs directly within the canonical transaction document without requiring relational join tables.
+Migrating to MongoDB provided a document representation where `source_message_ids` is stored as an array of strings. With a multikey index on this field, lookups by message ID are resolved through index entries rather than scanning document text. In addition, document storage allows grouping multiple evidencing message IDs directly within the transaction document without requiring a separate relational join table.
 
 ### Persistence Abstraction
-The architecture maintains a strict separation of concerns between business/domain logic and storage engines:
-* **`LedgerStore`**: Generic persistence interface (`save`, `all`, `count`, `saveDiscrepancy`, `discrepancies`). Implemented by `InMemoryLedgerStore`, `SqlLedgerStore`, and `MongoDocumentStore`.
-* **`DocumentStore`**: Query interface declaring the three application access patterns (`forAccountMonth`, `categoryTotals`, `byMessageId`, `save`).
-* `MongoDocumentStore` implements both `DocumentStore` and `LedgerStore` (as well as `AutoCloseable`), enabling MongoDB to act as both the high-performance document query engine and the core ledger store without duplicating ingestion, categorization, or reconciliation logic.
+The architecture separates domain logic from storage mechanisms:
+* **`LedgerStore`**: Persistence interface (`save`, `all`, `count`, `saveDiscrepancy`, `discrepancies`). Implemented by `InMemoryLedgerStore`, `SqlLedgerStore`, and `MongoDocumentStore`.
+* **`DocumentStore`**: Interface declaring the three access patterns (`forAccountMonth`, `categoryTotals`, `byMessageId`, `save`).
+* `MongoDocumentStore` implements both `DocumentStore` and `LedgerStore` (as well as `AutoCloseable`). This allows MongoDB to serve both document-specific query patterns and general ledger ingestion without duplicating business logic.
 
 ### MongoDB Document Model
-The domain contract `NormalizedTxn` is frozen and cannot be modified. The MongoDB document maps each field directly:
-* `_id` and `txn_key`: Natural compound identity string `accountLast4|occurredAt|direction|amount|merchant`.
-* `account_last4`: String (`VARCHAR(4)` equivalent).
+The domain contract `NormalizedTxn` is frozen and remains unaltered. The MongoDB document fields map to the domain model as follows:
+* `_id` and `txn_key`: Compound identity string `accountLast4|occurredAt|direction|amount|merchant`.
+* `account_last4`: String.
 * `occurred_at`: ISO-8601 string (`YYYY-MM-DDTHH:mm:ss+HH:MM`).
-* `direction`: String enum (`DEBIT` or `CREDIT`).
+* `direction`: String enum name (`DEBIT` or `CREDIT`).
 * `amount`: BSON `Decimal128`.
-* `category`: String enum (`SPEND`, `INCOME`, `MICRO`, `TRANSFER`).
+* `category`: String enum name (`SPEND`, `INCOME`, `MICRO`, `TRANSFER`).
 * `merchant`: String.
 * `source_message_ids`: BSON array of strings.
 
 ### Monetary Precision
-Financial calculations cannot tolerate binary floating-point representation (`float`/`double`), which introduces binary rounding anomalies (e.g., `0.1 + 0.2 != 0.3`). 
-* In SQL, exact precision was maintained using `DECIMAL(14, 2)`.
-* In MongoDB, exact precision is preserved using BSON `Decimal128` (IEEE 754-2008 decimal floating-point format), which maps to and from Java's `BigDecimal` with exact scale preservation (2 decimal places to the paisa).
+Monetary calculations cannot use binary floating-point representations (`float`/`double`), which introduce rounding anomalies (e.g., `0.1 + 0.2 != 0.3`).
+* In SQL, precision was maintained using `DECIMAL(14, 2)`.
+* In MongoDB, precision is maintained using BSON `Decimal128` (IEEE 754-2008 decimal floating-point format). This maps directly to Java's `BigDecimal` and preserves scale to two decimal places.
 
 ### Indexing Strategy
-Indexes were designed strictly to support the three required query patterns:
-1. **`idx_account_occurred` on `{ account_last4: 1, occurred_at: -1 }`**: Supports `forAccountMonth`. The equality filter on `account_last4` is placed first, followed by the range and sort key `occurred_at` in descending order. This guarantees that MongoDB satisfies both the filter and the sort directly from the B-tree without an in-memory sort stage.
-2. **`idx_account_cat_amt` on `{ account_last4: 1, category: 1, amount: 1 }`**: Supports `categoryTotals`. Because the index contains all three fields involved in the `$match` and `$group` stages, the aggregation pipeline operates as a covered index scan, examining 0 document bodies from disk.
-3. **`idx_source_msg` on `{ source_message_ids: 1 }`**: Supports `byMessageId`. Because `source_message_ids` is an array, MongoDB builds a multikey B-tree index where each array element is an index entry, allowing instant point lookups.
-4. **`idx_txn_key_unique` on `{ txn_key: 1 }`**: Enforces transaction uniqueness across all writes.
+Indexes were created to support the required access patterns:
+1. **`idx_account_occurred` on `{ account_last4: 1, occurred_at: -1 }`**: Supports `forAccountMonth`. The compound index supports filtering by account and occurred_at while maintaining the requested timestamp ordering.
+2. **`idx_account_cat_amt` on `{ account_last4: 1, category: 1, amount: 1 }`**: Supports `categoryTotals`. MongoDB explain statistics for the benchmark reported `totalDocsExamined: 0`.
+3. **`idx_source_msg` on `{ source_message_ids: 1 }`**: Supports `byMessageId`. Uses the `source_message_ids` index to locate transactions by message ID.
+4. **`idx_txn_key_unique` on `{ txn_key: 1 }`**: Enforces uniqueness on the transaction key.
 
 ### Idempotency
-Ingestion and backfill pipelines must be safe against repeated executions or overlapping message batches:
-* A transaction's natural identity is `(account_last4, occurred_at, direction, amount, merchant)`.
+Ingestion and backfill pipelines prevent duplicate documents upon repeated runs:
+* A transaction's natural identity is computed from `(account_last4, occurred_at, direction, amount, merchant)`.
 * `MongoDocumentStore.save()` uses an upsert operation:
   * Filter: `{ _id: txnKey }`
-  * Updates: `$setOnInsert` for all transaction fields, combined with `$addEachToSet` on `source_message_ids`.
-* If a message evidencing an existing transaction arrives later, the transaction document is updated to include the new message ID without creating a duplicate record or altering balances.
+  * Updates: `$setOnInsert` for transaction fields, combined with `$addEachToSet` on `source_message_ids`.
+* If an evidencing message for an existing transaction is processed again, the message ID is appended to `source_message_ids` via set accumulation without creating a new document.
 
 ### Backfill Strategy
-The `Backfill` component migrates historical data from `SqlLedgerStore` to `DocumentStore`:
-* The legacy SQL database contains unmerged duplicate rows (e.g., `V2__seed.sql` where `m-legacy-0001` was inserted twice, or multiple alerts for the same event were inserted as separate rows).
-* `Backfill.run()` consolidates historical SQL rows in memory by transaction identity, merging unique message IDs into canonical sets.
+The `Backfill` component migrates data from `SqlLedgerStore` to `DocumentStore`:
+* Historical SQL data contains duplicate rows (e.g., `V2__seed.sql` where identical records or multiple alerts for the same event were inserted as separate rows).
+* `Backfill.run()` consolidates SQL rows in memory by natural transaction identity, combining unique message IDs into a set.
 * Each consolidated transaction is saved to `DocumentStore.save()`.
-* The backfill tracks `read`, `written`, and `skipped`. On the initial run, duplicate historical rows are skipped. On subsequent runs, existing records are recognized and skipped (`written = 0, skipped = read`), ensuring zero duplication.
+* The backfill tracks `read`, `written`, and `skipped`. On the initial run, duplicate rows within SQL are skipped. On subsequent runs, existing documents are recognized and skipped (`written = 0, skipped = read`), avoiding duplicate inserts.
 
 ### Consistency Checking
-The `ConsistencyChecker` verifies that `SqlLedgerStore` and `DocumentStore` agree completely:
-* Rather than comparing row counts or balance sums (which can easily mask offsetting errors), the checker compares actual transaction contents.
-* **Missing in Documents**: Detects transactions present in SQL but absent in MongoDB (`MISSING_IN_DOCUMENTS`).
-* **Missing in SQL**: Detects transactions present in MongoDB but absent in SQL (`MISSING_IN_SQL`).
-* **Field-Level Differences**: For every matching transaction key, verifies `amount`, `category`, `direction`, `merchant`, `occurred_at`, and `source_message_ids` (`FIELD_MISMATCH`).
-* **Traceability Check**: Verifies that every message ID listed in a transaction resolves back to that transaction via `byMessageId`.
+The `ConsistencyChecker` compares `SqlLedgerStore` and `DocumentStore`:
+* **Missing in Documents**: Identifies transactions present in SQL but absent in MongoDB (`MISSING_IN_DOCUMENTS`).
+* **Missing in SQL**: Identifies transactions present in MongoDB but absent in SQL (`MISSING_IN_SQL`).
+* **Field-Level Differences**: For matching transaction keys, compares `amount`, `category`, `direction`, `merchant`, `occurred_at`, and `source_message_ids` (`FIELD_MISMATCH`).
+* **Traceability Check**: Verifies that each message ID in a document resolves back to that transaction through `byMessageId`.
 
 ---
 
@@ -339,8 +338,8 @@ The `ConsistencyChecker` verifies that `SqlLedgerStore` and `DocumentStore` agre
 ### Reconciliation Gap
 When evaluating the provided corpus (`fixtures/corpus-a.jsonl`) against expected checkpoint totals (`fixtures/corpus-a-totals.json`):
 * The totals file expects **257 transactions**; the message corpus contains evidence for **256 transactions**.
-* Specifically, on account `**4821`, between consecutive bank alerts on **2026-07-29T17:06+05:30**, the bank-stated available balance drops by **₹7,500.00** without any evidencing SMS or email in the corpus.
-* **Intentional Architecture Decision**: The system intentionally surfaces this discrepancy in `reconciliation.json` as:
+* Specifically, on account `**4821`, between consecutive bank alerts on **2026-07-29T17:06+05:30**, the bank-stated available balance drops by **₹7,500.00** without an evidencing SMS or email in the corpus.
+* **Handling**: The system reports this in `reconciliation.json` as:
   ```json
   {
     "account_last4": "4821",
@@ -349,34 +348,34 @@ When evaluating the provided corpus (`fixtures/corpus-a.jsonl`) against expected
     "note": "Bank stated balance dropped by 7500.00 without an evidencing transaction"
   }
   ```
-  The engine **does not fabricate synthetic or phantom transactions** to force transaction counts to match 257. In a financial ledger, inventing missing debits violates auditability; honest reporting of discrepancies is the intended behavior.
+  The implementation intentionally reports this as a reconciliation discrepancy rather than inventing a ledger transaction.
 
 ### System Scope Limitations
-* **Batch Ingestion Model**: The service currently processes static message batches from `.jsonl` corpora. Live streaming ingest (e.g., Kafka, webhook endpoints, or continuous phone sync) is out of scope for this seed.
-* **Local Docker MongoDB**: MongoDB runs via Docker Compose in single-node standalone mode for local development and testing. Production deployments would require a multi-node replica set with TLS encryption and authenticated role-based access.
-* **No Direct Banking/Network Integration**: The service functions strictly by parsing consumer device notifications (SMS and email). It does not interface directly with core banking systems, NPCI/UPI switches, or payment gateway APIs.
-* **Parser Coverage**: Parsers are implemented for the formats present in the corpus (HDFC SMS, ICICI SMS, and bank email templates). Unrecognized banks or novel message formats fall through as unparsed messages.
+* **Batch Ingestion Model**: The service processes static message batches from `.jsonl` files. Live streaming ingestion (e.g., Kafka, webhook endpoints, or real-time mobile sync) is not implemented.
+* **Local Docker Deployment**: MongoDB runs via Docker Compose in standalone mode for local development and testing. Production deployments would typically require a managed replica set with TLS and access controls.
+* **No Direct Core Banking Integration**: The service operates by parsing consumer device notifications (SMS and email). It does not interface directly with core banking networks, UPI switches, or payment gateway APIs.
+* **Parser Coverage**: Parsers are implemented for the formats present in the corpus (HDFC SMS, ICICI SMS, and bank email templates). Other bank notification templates are not supported.
 
 ---
 
 ## AI Assistance
 
-AI tools were used as development assistance during the implementation of this project.
+AI tools were used as development assistance during the implementation.
 
-Specifically, AI assistance was utilized for:
-* Exploring MongoDB Java Driver Sync APIs and index syntax options.
-* Drafting initial templates for BSON document mapping and index creation.
-* Reviewing edge cases for cross-platform classpath handling in bash scripts on Windows.
-* Generating initial drafts for test cases covering access patterns and divergence detection.
-* Formatting and reviewing documentation for completeness and clarity.
+Specifically, AI assistance was used for:
+* Reviewing MongoDB Java Driver Sync APIs and query syntax.
+* Drafting templates for BSON document mapping and index creation.
+* Checking cross-platform classpath handling in bash scripts on Windows.
+* Suggesting test cases for access patterns and divergence detection.
+* Reviewing and refining documentation.
 
-All generated code, queries, and logic were manually reviewed, adapted to project constraints, verified against the frozen domain contracts, and validated using local test suites and Docker Compose environments. Domain decisions—particularly regarding honest reconciliation and idempotency—were verified independently against the assignment specifications.
+All generated code, queries, and logic were reviewed, adapted to project constraints, verified against the frozen domain contracts, and validated using local test suites and Docker Compose. Business logic and reconciliation decisions were reviewed rather than accepting generated suggestions without evaluation.
 
 ---
 
 ## Final Verification
 
-The current repository passes all verification suites:
+The repository verification suites confirm the following results:
 
 * **Automated Unit & Integration Tests**: **36 tests passed**, **0 failures**, **0 errors** across 6 test suites:
   * `AmountsTest`: 9 passed
@@ -389,14 +388,14 @@ The current repository passes all verification suites:
   * **522 messages read**
   * **256 transactions written**
   * **43 messages skipped** (non-transactional notifications)
-  * **1 reconciliation discrepancy** (the ₹7,500.00 unevidenced balance drop on account `**4821`)
+  * **1 reconciliation discrepancy** (the ₹7,500.00 balance drop on account `**4821`)
 * **Category Totals**:
   * `SPEND`: ₹142,567.64
   * `INCOME`: ₹142,791.16
   * `MICRO`: ₹4,443.85
   * `TRANSFER`: ₹62,000.00
 * **Consistency Check**:
-  * **0 divergences found** between SQL and MongoDB (`CONSISTENCY CHECK PASSED`).
+  * **0 divergences found** between SQL and MongoDB (`CONSISTENCY CHECK PASSED: SQL and DocumentStore agree perfectly.`).
 
 ---
 
