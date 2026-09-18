@@ -184,6 +184,50 @@ Then:
 
 ---
 
+## Task 4: MongoDB Document Store Implementation
+
+### 1. Running the System
+```bash
+# Start MongoDB container
+docker compose up -d
+
+# Verify pipeline and baseline SelfCheck (pure JDK, no network needed)
+./verify.sh
+
+# Run complete test suite (including MongoDocumentStoreTest)
+./gradlew test
+
+# Migrate and ingest raw corpus into SQL ledger
+./gradlew run --args="migrate"
+./gradlew run --args="ingest fixtures/corpus-a.jsonl"
+./gradlew run --args="report submission/"
+
+# Backfill from SQL into MongoDB (safe to rerun repeatedly)
+./gradlew run --args="backfill"
+
+# Verify SQL and MongoDB are strictly consistent
+./gradlew run --args="check"
+
+# Stop MongoDB container when done
+docker compose down
+```
+
+### 2. The Six Examined-vs-Returned Numbers (at 100,000 transactions)
+
+| Access Pattern | Method | `totalDocsExamined` | `nReturned` | Supporting Index |
+|---|---|---|---|---|
+| **Q1** | `forAccountMonth` | **2,976** | **2,976** | `{ "account_last4": 1, "occurred_at": -1 }` |
+| **Q2** | `categoryTotals` | **0** | **20,000** | `{ "account_last4": 1, "category": 1, "amount": 1 }` (Index-covered scan) |
+| **Q3** | `byMessageId` | **1** | **1** | `{ "source_message_ids": 1 }` (Multikey index) |
+
+### 3. Key Design Decisions
+- **BSON Decimal128**: Exact monetary representation to 2 decimal places, mapping directly to Java `BigDecimal`. No floating-point rounding errors.
+- **Strict Idempotency**: Natural transaction identity `accountLast4|occurredAt|direction|amount|merchant` is indexed with a unique constraint (`_id` / `txn_key`). Saving the same transaction multiple times merges `source_message_ids` via `$addToSet` without creating duplicate documents.
+- **Safe Backfill**: Consolidates historical duplicate rows in SQL (such as legacy duplicates in `V2__seed.sql`) and merges message IDs into canonical documents. Re-running backfill is completely idempotent (`written = 0, skipped = read`).
+- **ConsistencyChecker**: Performs bidirectional field-level comparison between SQL and MongoDB (`amount`, `category`, `direction`, `merchant`, `occurred_at`, `source_message_ids`), detecting alterations instantly.
+
+---
+
 ## Rules
 
 - `model/NormalizedTxn.java`, `model/Category.java` and

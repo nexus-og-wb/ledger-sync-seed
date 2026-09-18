@@ -60,6 +60,39 @@ public final class App {
                     System.out.println("wrote 3 files to " + out);
                 }
             }
+            case "backfill" -> {
+                try (SqlLedgerStore sqlStore = new SqlLedgerStore(DB);
+                     in.simplifymoney.ledgersync.store.MongoDocumentStore mongoStore =
+                             new in.simplifymoney.ledgersync.store.MongoDocumentStore(
+                                     in.simplifymoney.ledgersync.store.MongoConfig.fromEnv())) {
+                    in.simplifymoney.ledgersync.store.Backfill backfill =
+                            new in.simplifymoney.ledgersync.store.Backfill(sqlStore, mongoStore);
+                    var result = backfill.run();
+                    System.out.printf("backfill completed: read=%d, written=%d, skipped=%d%n",
+                            result.read(), result.written(), result.skipped());
+                    System.out.println("mongo transactions: " + mongoStore.count());
+                }
+            }
+            case "check" -> {
+                try (SqlLedgerStore sqlStore = new SqlLedgerStore(DB);
+                     in.simplifymoney.ledgersync.store.MongoDocumentStore mongoStore =
+                             new in.simplifymoney.ledgersync.store.MongoDocumentStore(
+                                     in.simplifymoney.ledgersync.store.MongoConfig.fromEnv())) {
+                    in.simplifymoney.ledgersync.store.ConsistencyChecker checker =
+                            new in.simplifymoney.ledgersync.store.ConsistencyChecker(sqlStore, mongoStore);
+                    var divergences = checker.check();
+                    if (divergences.isEmpty()) {
+                        System.out.println("CONSISTENCY CHECK PASSED: SQL and DocumentStore agree perfectly.");
+                    } else {
+                        System.err.printf("CONSISTENCY CHECK FAILED: %d divergences found!%n", divergences.size());
+                        for (var d : divergences) {
+                            System.err.printf("  [%s]%n    in SQL:       %s%n    in Documents: %s%n",
+                                    d.what(), d.inSql(), d.inDocuments());
+                        }
+                        System.exit(1);
+                    }
+                }
+            }
             default -> {
                 System.err.println("unknown command: " + args[0]);
                 System.exit(2);

@@ -41,7 +41,6 @@ public final class IngestService {
 
     public Stats ingestFile(Path corpus) throws IOException {
         List<RawMessage> messages = readCorpus(corpus);
-        int parsed = 0;
         int skipped = 0;
 
         Map<TxnKey, List<ParsedTxn>> grouped = new LinkedHashMap<>();
@@ -54,7 +53,6 @@ public final class IngestService {
                 skipped++;
                 continue;
             }
-            parsed++;
             ParsedTxn t = p.get();
             parsedByMessageId.put(m.messageId(), t);
             if (m.body().contains("Avl Limit") || m.body().contains("Card x") || m.body().contains("Bank Card")) {

@@ -4,10 +4,24 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+SEP=":"
+case "$(uname -s 2>/dev/null || echo Windows)" in
+    *CYGWIN*|*MINGW*|*MSYS*|*NT*) SEP=";" ;;
+esac
+
+CP="build/selfcheck"
+if [ -d "lib" ]; then
+    for jar in lib/*.jar; do
+        if [ -f "$jar" ]; then
+            CP="$CP$SEP$jar"
+        fi
+    done
+fi
+
 echo "==> compiling"
 rm -rf build/selfcheck && mkdir -p build/selfcheck
-javac -d build/selfcheck $(find src/main/java -name '*.java')
+javac -cp "$CP" -d build/selfcheck $(find src/main/java -name '*.java')
 
 echo
 echo "==> running"
-java -cp build/selfcheck in.simplifymoney.ledgersync.SelfCheck "$@"
+java -cp "$CP" in.simplifymoney.ledgersync.SelfCheck "$@"
