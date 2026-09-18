@@ -14,10 +14,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Stream;
 
 /**
@@ -43,6 +45,8 @@ public final class IngestService {
         int skipped = 0;
 
         Map<TxnKey, List<ParsedTxn>> grouped = new LinkedHashMap<>();
+        Map<String, ParsedTxn> parsedByMessageId = new LinkedHashMap<>();
+        Set<String> cardAccounts = new HashSet<>();
 
         for (RawMessage m : messages) {
             Optional<ParsedTxn> p = parsers.parse(m);
@@ -52,10 +56,16 @@ public final class IngestService {
             }
             parsed++;
             ParsedTxn t = p.get();
+            parsedByMessageId.put(m.messageId(), t);
+            if (m.body().contains("Avl Limit") || m.body().contains("Card x") || m.body().contains("Bank Card")) {
+                cardAccounts.add(t.accountLast4());
+            }
+
             TxnKey key = new TxnKey(t.accountLast4(), t.occurredAt(), t.direction(), t.amount(), t.merchant());
             grouped.computeIfAbsent(key, k -> new ArrayList<>()).add(t);
         }
 
+        List<NormalizedTxn> writtenTxns = new ArrayList<>();
         int written = 0;
         for (Map.Entry<TxnKey, List<ParsedTxn>> entry : grouped.entrySet()) {
             List<ParsedTxn> txns = entry.getValue();
@@ -83,7 +93,17 @@ public final class IngestService {
                     merchant,
                     messageIds);
             store.save(normalized);
+            writtenTxns.add(normalized);
             written++;
+        }
+
+        // Reconciliation: detect balance gaps and save discrepancies
+        in.simplifymoney.ledgersync.reconcile.ReconciliationService reconciler =
+                new in.simplifymoney.ledgersync.reconcile.ReconciliationService();
+        List<in.simplifymoney.ledgersync.model.Discrepancy> discrepancies =
+                reconciler.reconcile(writtenTxns, parsedByMessageId, cardAccounts);
+        for (in.simplifymoney.ledgersync.model.Discrepancy d : discrepancies) {
+            store.saveDiscrepancy(d);
         }
 
         return new Stats(messages.size(), written, skipped);

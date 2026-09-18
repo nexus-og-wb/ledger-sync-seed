@@ -70,6 +70,16 @@ public final class SelfCheck {
                     running.toPlainString(), closing.toPlainString(),
                     running.subtract(closing).toPlainString());
         }
+
+        List<in.simplifymoney.ledgersync.model.Discrepancy> discrepancies = store.discrepancies();
+        if (!discrepancies.isEmpty()) {
+            System.out.println("\nRECONCILIATION DISCREPANCIES (" + discrepancies.size() + "):");
+            for (in.simplifymoney.ledgersync.model.Discrepancy d : discrepancies) {
+                System.out.printf("  **%s at %s: amount %s (%s)%n",
+                        d.accountLast4(), d.occurredAt(), d.amount().toPlainString(), d.note());
+            }
+        }
+
         System.out.println("\nThis is the starting point, not the finish line.");
     }
 }

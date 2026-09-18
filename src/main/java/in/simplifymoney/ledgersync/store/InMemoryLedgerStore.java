@@ -1,5 +1,6 @@
 package in.simplifymoney.ledgersync.store;
 
+import in.simplifymoney.ledgersync.model.Discrepancy;
 import in.simplifymoney.ledgersync.model.NormalizedTxn;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -9,10 +10,21 @@ import java.util.List;
 public final class InMemoryLedgerStore implements LedgerStore {
 
     private final List<NormalizedTxn> rows = new ArrayList<>();
+    private final List<Discrepancy> discrepancies = new ArrayList<>();
 
     @Override public void save(NormalizedTxn txn) { rows.add(txn); }
 
     @Override public List<NormalizedTxn> all() { return Collections.unmodifiableList(rows); }
 
     @Override public long count() { return rows.size(); }
+
+    @Override
+    public void saveDiscrepancy(Discrepancy d) {
+        discrepancies.add(d);
+    }
+
+    @Override
+    public List<Discrepancy> discrepancies() {
+        return Collections.unmodifiableList(discrepancies);
+    }
 }

@@ -2,6 +2,7 @@ package in.simplifymoney.ledgersync.store;
 
 import in.simplifymoney.ledgersync.model.Category;
 import in.simplifymoney.ledgersync.model.Direction;
+import in.simplifymoney.ledgersync.model.Discrepancy;
 import in.simplifymoney.ledgersync.model.NormalizedTxn;
 import java.math.BigDecimal;
 import java.nio.file.Files;
@@ -32,11 +33,25 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
     public SqlLedgerStore(Path dbFile) {
         try {
             this.conn = DriverManager.getConnection(
-                    URL_PREFIX + dbFile.toAbsolutePath() + ";MODE=PostgreSQL", "sa", "");
+                    URL_PREFIX + dbFile.toAbsolutePath() + ";MODE=LEGACY", "sa", "");
+            ensureDiscrepanciesTable();
         } catch (SQLException e) {
             throw new IllegalStateException(
                     "could not open the ledger database at " + dbFile
-                            + " (is the H2 driver on the runtime classpath?)", e);
+                            + " (is the H2 driver on the runtime classpath?)",
+                    e);
+        }
+    }
+
+    private void ensureDiscrepanciesTable() {
+        try (Statement st = conn.createStatement()) {
+            st.execute("CREATE TABLE IF NOT EXISTS discrepancies ("
+                    + "  id IDENTITY PRIMARY KEY,"
+                    + "  account_last4 VARCHAR(4) NOT NULL,"
+                    + "  occurred_at VARCHAR(40) NOT NULL,"
+                    + "  amount DECIMAL(14, 2) NOT NULL,"
+                    + "  note VARCHAR(500) NOT NULL)");
+        } catch (SQLException ignored) {
         }
     }
 
@@ -57,12 +72,14 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
                         "SELECT 1 FROM schema_history WHERE filename = ?")) {
                     q.setString(1, name);
                     try (ResultSet rs = q.executeQuery()) {
-                        if (rs.next()) continue;
+                        if (rs.next())
+                            continue;
                     }
                 }
                 String sql = Files.readString(f);
                 for (String stmt : sql.split(";")) {
-                    if (!stmt.isBlank()) st.execute(stmt);
+                    if (!stmt.isBlank())
+                        st.execute(stmt);
                 }
                 try (PreparedStatement ins = conn.prepareStatement(
                         "INSERT INTO schema_history(filename) VALUES (?)")) {
@@ -99,9 +116,9 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
     public List<NormalizedTxn> all() {
         List<NormalizedTxn> out = new ArrayList<>();
         try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery(
-                     "SELECT account_last4, occurred_at, direction, amount, category,"
-                             + " merchant, source_message_ids FROM ledger ORDER BY occurred_at")) {
+                ResultSet rs = st.executeQuery(
+                        "SELECT account_last4, occurred_at, direction, amount, category,"
+                                + " merchant, source_message_ids FROM ledger ORDER BY occurred_at")) {
             while (rs.next()) {
                 out.add(new NormalizedTxn(
                         rs.getString(1),
@@ -120,9 +137,42 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
     }
 
     @Override
+    public void saveDiscrepancy(Discrepancy d) {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO discrepancies(account_last4, occurred_at, amount, note) VALUES (?,?,?,?)")) {
+            ps.setString(1, d.accountLast4());
+            ps.setString(2, d.occurredAt().toString());
+            ps.setBigDecimal(3, d.amount());
+            ps.setString(4, d.note());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("could not save discrepancy " + d, e);
+        }
+    }
+
+    @Override
+    public List<Discrepancy> discrepancies() {
+        List<Discrepancy> out = new ArrayList<>();
+        try (Statement st = conn.createStatement();
+                ResultSet rs = st.executeQuery(
+                        "SELECT account_last4, occurred_at, amount, note FROM discrepancies ORDER BY occurred_at")) {
+            while (rs.next()) {
+                out.add(new Discrepancy(
+                        rs.getString(1),
+                        OffsetDateTime.parse(rs.getString(2)),
+                        rs.getBigDecimal(3).setScale(2),
+                        rs.getString(4)));
+            }
+        } catch (SQLException e) {
+            return List.of();
+        }
+        return out;
+    }
+
+    @Override
     public long count() {
         try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM ledger")) {
+                ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM ledger")) {
             return rs.next() ? rs.getLong(1) : 0L;
         } catch (SQLException e) {
             throw new IllegalStateException("could not count the ledger", e);
@@ -131,9 +181,10 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
 
     public BigDecimal sumAmounts() {
         try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT SUM(amount) FROM ledger")) {
+                ResultSet rs = st.executeQuery("SELECT SUM(amount) FROM ledger")) {
             return rs.next() && rs.getBigDecimal(1) != null
-                    ? rs.getBigDecimal(1).setScale(2) : BigDecimal.ZERO.setScale(2);
+                    ? rs.getBigDecimal(1).setScale(2)
+                    : BigDecimal.ZERO.setScale(2);
         } catch (SQLException e) {
             throw new IllegalStateException("could not total the ledger", e);
         }
@@ -141,6 +192,9 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
 
     @Override
     public void close() {
-        try { conn.close(); } catch (SQLException ignored) { }
+        try {
+            conn.close();
+        } catch (SQLException ignored) {
+        }
     }
 }
