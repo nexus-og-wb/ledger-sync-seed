@@ -51,7 +51,8 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
                     + "  occurred_at VARCHAR(40) NOT NULL,"
                     + "  amount DECIMAL(14, 2) NOT NULL,"
                     + "  note VARCHAR(500) NOT NULL)");
-        } catch (SQLException ignored) {
+        } catch (SQLException e) {
+            throw new IllegalStateException("could not create discrepancies table", e);
         }
     }
 
@@ -164,7 +165,7 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
                         rs.getString(4)));
             }
         } catch (SQLException e) {
-            return List.of();
+            throw new IllegalStateException("could not read discrepancies", e);
         }
         return out;
     }
